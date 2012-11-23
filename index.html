@@ -1,0 +1,723 @@
+<html>
+    <head>
+        <script id="vertex-shader-source" type="x-shader/x-vertex">
+            precision highp float;
+
+            attribute vec4 position;
+            varying vec2 screenPos;
+
+            uniform float screenWidth;
+            uniform float screenHeight;
+
+            void main()
+            {
+                screenPos.x = (position.x + 1.) / 2. * screenWidth;
+                screenPos.y = (position.y + 1.) / 2. * screenHeight;
+                
+                gl_Position = vec4(position.x, position.y, -1, 1);
+            }
+        </script>
+        <script id="fragment-shader-source" type="x-shader/x-fragment">
+            precision highp float;
+
+            varying vec2 screenPos;
+            
+            uniform float numSpheres;
+
+            uniform vec3 lightPos;
+            uniform vec3 lightColor;
+
+            uniform float haltonNumbers[8];
+            uniform float frameCounter;
+
+            uniform vec3 cameraPos;
+            uniform vec3 cameraUp;
+            uniform vec3 cameraDir;
+            uniform float stepX;
+            uniform float stepY;
+            uniform float screenWidth;
+            uniform float screenHeight;
+            uniform float focalLength;
+
+            uniform sampler2D sceneTexture;
+            uniform sampler2D imageData;
+            uniform sampler2D cranleyPatterson;
+            
+            const float M_PI = 3.14159265;
+            
+            vec3 visualize(in vec3 v)
+            {
+                return vec3((v[0]+1.)/2., (v[1]+1.)/2., (v[2]+1.)/2.);
+            }
+
+            void getRay(out vec3 rayOrigin, out vec3 rayDir)
+            {
+                rayOrigin = cameraPos;
+                rayDir =   cameraDir * focalLength 
+                         + cross(cameraDir, cameraUp) * (screenPos[0] - screenWidth/2.) * stepX
+                         + cameraUp * (screenPos[1] - screenHeight/2.) * stepY; 
+                rayDir = normalize(rayDir);
+            }
+            
+            bool intersectRaySphere(in vec3 rayOrigin, in vec3 rayDir, 
+                                    in vec3 spherePos, in float sphereRadius,
+                                    out float t)
+            {
+                vec3 relRayOrigin = rayOrigin - spherePos;
+                
+                float a = dot(rayDir,rayDir);
+                float b = 2. * (dot(rayDir, relRayOrigin));
+                float c = dot(relRayOrigin,relRayOrigin) - sphereRadius*sphereRadius;
+                
+                float d = b*b - 4.*a*c;
+                
+                if(d < 0.)
+                    return false;
+                else
+                {
+                    float t0 = (-b - sqrt(d)) / (2.*a);
+                    float t1 = (-b + sqrt(d)) / (2.*a);
+                
+                    t = min(t0, t1);
+                    return t>0.;
+                }
+            }
+
+            void onb(in vec3 vec, out vec3 u, out vec3 v, out vec3 w)
+            {
+                vec3 m0 = vec3(1.,0.,0.);
+                vec3 m1 = vec3(0.,1.,0.);
+                
+                w = normalize(vec);
+                
+                u = cross(w,m0);
+                if(length(u) < 0.1)
+                    u = cross(w,m1);
+                u = normalize(u);
+                v = cross(w,u);
+            }
+            
+            vec3 sampleHemisphereCos(in vec3 normal, in float r0, in float r1)
+            {
+                vec3 u,v,w;
+                
+                onb(normal, u, v, w);
+                
+                float radius = sqrt(r0);
+                float phi = 2. * M_PI * r1;
+                
+                float x = radius * cos(phi);
+                float y = radius * sin(phi);
+                float z = sqrt(1. - radius*radius);
+                
+                vec3 d = x*u + y*v + z*w;
+                return d;
+            }
+            
+            float fresnel(float eta1, float eta2, float cos_theta_i)
+            {
+                float a = eta1 - eta2;
+                float b = eta1 + eta2;
+                float R0 = a*a/(b*b);
+
+                float onemcos = 1. - cos_theta_i;
+
+                float R = R0 + (1. - R0) * onemcos*onemcos*onemcos*onemcos*onemcos;
+                return R;
+            }
+            
+            float fresnel(in float R0, float cos_theta_i)
+            {
+                float onemcos = 1. - cos_theta_i;
+
+                float R = R0 + (1. - R0) * onemcos*onemcos*onemcos*onemcos*onemcos;
+                return R;
+            }
+            
+            vec3 sampleTransmission(in vec3 incident, in vec3 normal, in float eta)
+            {               
+                return refract(incident, normal, 1./eta);
+            }
+            
+            vec3 sampleMirror(in vec3 incident, in vec3 normal)
+            {
+                return reflect(incident, normal);
+            }
+            
+            bool trace(in vec3 rayOrigin, in vec3 rayDir, out float t, out float sphereIndex)
+            {
+                t = 99999.;
+                sphereIndex = -1.;
+                for(float i=1./18.; i<=9./9.; i+=1./9.)
+                {
+                    vec3 spherePos = vec3(texture2D(sceneTexture, vec2(i,0./11.))[0],
+                                          texture2D(sceneTexture, vec2(i,1./11.))[0],
+                                          texture2D(sceneTexture, vec2(i,2./11.))[0]);
+                    float sphereRadius = texture2D(sceneTexture, vec2(i,3./11.))[0];
+                    float curT;
+                    
+                    if(intersectRaySphere(rayOrigin, rayDir, spherePos, sphereRadius, curT))
+                    {
+                        if(curT > 0.0001 && curT < t)
+                        {
+                            t = curT;
+                            sphereIndex = i;
+                        }
+                    }
+                }
+                return sphereIndex>-.5;
+            }
+            
+            vec3 shading(in vec3 hitPos, in vec3 normal, in vec3 objectColor)
+            {
+                vec3 toLight = lightPos - hitPos;
+
+                vec3 outDir = normalize(toLight);
+                
+                float t, sphereIndex;
+                if(trace(hitPos, outDir, t, sphereIndex))
+                    if(t < length(toLight))
+                        return vec3(0,0,0);
+                //return (outDir * vec3(0.5,0.5,0.5)) + vec3(.5,.5,.5);
+                
+                float cos_theta = dot(outDir, normal);
+                float attenuation = dot(toLight, toLight);
+                                
+                return lightColor * objectColor * cos_theta * 1./attenuation;
+                //return objectColor;
+            }
+           
+            void main()
+            {
+                vec3 rayOrigin, rayDir;
+                getRay(rayOrigin, rayDir);
+                
+                vec3 color = vec3(0.,0.,0.);
+                vec3 pathWeight = vec3(1.,1.,1.);
+                for(int i=0; i<4; ++i)
+                {
+                    float t;
+                    float sphereIndex;
+                    if(trace(rayOrigin, rayDir, t, sphereIndex))
+                    {
+                        vec3 spherePos = vec3(texture2D(sceneTexture, vec2(sphereIndex,0./11.+1./22.))[0],
+                                              texture2D(sceneTexture, vec2(sphereIndex,1./11.+1./22.))[0],
+                                              texture2D(sceneTexture, vec2(sphereIndex,2./11.+1./22.))[0]);
+                        float type = texture2D(sceneTexture, vec2(sphereIndex,4./11.+1./22.))[0];
+                        vec3 sphereColor = vec3(texture2D(sceneTexture, vec2(sphereIndex,5./11.+1./22.))[0],
+                                                texture2D(sceneTexture, vec2(sphereIndex,6./11.+1./22.))[0],
+                                                texture2D(sceneTexture, vec2(sphereIndex,7./11.+1./22.))[0]);
+                        vec3 sphereEmit = vec3(texture2D(sceneTexture, vec2(sphereIndex,8./11.+1./22.))[0],
+                                               texture2D(sceneTexture, vec2(sphereIndex,9./11.+1./22.))[0],
+                                               texture2D(sceneTexture, vec2(sphereIndex,10./11.+1./22.))[0]);
+
+                        // add emitted light
+                        color += sphereEmit * pathWeight;
+
+                        vec3 hitPos = rayOrigin + t*rayDir;
+                        vec3 normal = normalize(hitPos - spherePos);
+
+                        if(type < 0.1)
+                        {
+                            // diffuse reflection                   
+                            pathWeight = pathWeight * sphereColor;
+                            
+                            float offset0 = texture2D(cranleyPatterson, vec2(screenPos.x/screenWidth, (screenPos.y*8. + 2.*float(i))   /(screenHeight*8.)))[0];
+                            float offset1 = texture2D(cranleyPatterson, vec2(screenPos.x/screenWidth, (screenPos.y*8. + 2.*float(i)+1.)/(screenHeight*8.)))[0];
+                            float r0 = haltonNumbers[2*i]+offset0;
+                            float r1 = haltonNumbers[2*i+1]+offset1;
+                            if(r0 > 1.) r0 -= 1.;
+                            if(r1 > 1.) r1 -= 1.;
+                                
+                            rayOrigin = hitPos;
+                            rayDir = sampleHemisphereCos(normal, r0, r1);
+                        }
+                        else if(type < 1.1)
+                        {
+                            // transmission + mirror
+                            if(mod(frameCounter,2.) < 0.1)
+                            {
+                                float eta = 2.;
+                                
+                                float R = fresnel(eta, 1., abs(dot(rayDir,normal)));
+                                float fresnelWeight = max(1.-R,0.);
+                                
+                                rayOrigin = hitPos;
+                                rayDir = sampleTransmission(rayDir, normal, eta);
+                                
+                                pathWeight = pathWeight * 2. * fresnelWeight * vec3(1.,1.,1.);
+                            }
+                            else
+                            {
+                                rayOrigin = hitPos;
+                                rayDir = sampleMirror(rayDir, normal);
+                                
+                                float fresnelWeight = fresnel(1., abs(dot(rayDir,normal)));
+                                
+                                pathWeight = pathWeight * 2. * fresnelWeight * sphereColor;
+                            }
+                        }
+                        else
+                        {
+                            // mirror
+                            rayOrigin = hitPos;
+                            rayDir = sampleMirror(rayDir, normal);
+                            
+                            pathWeight = pathWeight * sphereColor;
+                        }
+                    }
+                }
+                
+                // tonemapping
+                //gl_FragColor = vec4(color / (vec3(1.,1.,1.) + color),1.);
+
+                
+                float x = screenPos[0] / screenWidth;
+                float y = screenPos[1] / screenHeight;
+                
+                vec4 prevColor = texture2D(imageData, vec2(x,y));
+                
+                gl_FragColor = mix(prevColor, vec4(color,1.), 1./frameCounter);
+            }
+        </script>
+        <script id="fragment-shader-display-source" type="x-shader/x-fragment">
+            precision highp float;
+
+            uniform sampler2D imageData;
+            
+            uniform float screenWidth;
+            uniform float screenHeight;
+
+            varying vec2 screenPos;
+
+            void main()
+            {
+                float x = screenPos[0] / screenWidth;
+                float y = screenPos[1] / screenHeight;
+
+                //gl_FragColor = texture2D(imageData, vec2(x,y));
+                
+                vec3 color = texture2D(imageData, vec2(x,y)).xyz;
+                gl_FragColor = vec4(color / (vec3(1.,1.,1.) + color),1.);
+            }
+        </script>
+        <script type="text/javascript">       
+            function nextHalton(radical, inverse)
+            {
+                var almostOne = 1.0 - 1e-10;
+                var nextInverse, digit1, digit2;
+                
+                nextInverse = inverse + radical;
+                
+                if(nextInverse < almostOne)
+                    return nextInverse;
+                else
+                {
+                    digit1 = radical;
+                    digit2 = radical * radical;
+                    
+                    while(inverse + digit2 >= almostOne)
+                    {
+                        digit1 = digit2;
+                        digit2 *= radical;
+                    }
+                    
+                    return inverse + (digit1 - 1.0) + digit2;
+                }
+            }
+
+            function makeBuffer(gl, target, bufferData, itemSize, numItems)
+            {
+                var buffer = gl.createBuffer();
+                gl.bindBuffer(target, buffer);
+                gl.bufferData(target, bufferData, gl.STATIC_DRAW);
+                return buffer;
+                
+            }
+            function makeShader(gl, type, source)
+            {
+                var shader = gl.createShader(type);
+                gl.shaderSource(shader, source);
+                gl.compileShader(shader);
+                
+                var ok = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+                if(!ok)
+                {
+                    alert(gl.getShaderInfoLog(shader));
+                    return null;
+                }
+                
+                return shader;
+            }
+            function makeProgram(gl, vertexShader, fragmentShader)
+            {
+                var program = gl.createProgram();
+                gl.attachShader(program, vertexShader);
+                gl.attachShader(program, fragmentShader);
+                gl.linkProgram(program);
+                
+                var ok = gl.getProgramParameter(program, gl.LINK_STATUS);
+                if(!ok)
+                {
+                    alert(gl.getProgramInfoLog(program));
+                    return null;
+                }
+                
+                return program;
+            }
+            
+            var resources = {
+                vertexBuffer: 0,
+                elementBuffer: 0,
+
+                programRender: {
+                    id: 0,
+                    
+                    attributes: {
+                        position: 0,
+                    },
+                    
+                    uniforms: {
+                        // scene
+                        numSpheres: 0,
+                        lightPos: 0,
+                        lightColor: 0,
+                        imageDataSampler: 0,
+                        cranleyPattersonSampler: 0,
+                        haltonNumbers: 0,
+                        frameCounter: 0,
+                        
+                        // camera
+                        cameraPos: 0,
+                        cameraUp: 0,
+                        cameraDir: 0,
+                        stepX: 0,
+                        stepY: 0,
+                        screenWidth: 0,
+                        screenHeight: 0,
+                        focalLength: 0,
+                    },
+                },
+                
+                programDisplay: {
+                    id: 0,
+                    
+                    attributes: {
+                        position: 0,
+                    },
+                
+                    uniforms: {
+                        imageDataSampler: 0,
+                        
+                        screenWidth: 0,
+                        screenHeight: 0,
+                    },
+                },
+                
+                textures: {
+                    sceneTexture: 0,
+                    imageDataTexture: 0,
+                    cranleyPattersonTexture: 0,
+                },
+                
+                framebuffers: {
+                    imageDataBuffer: 0,
+                },
+                
+                vertexShader: 0,
+                fragmentShader: 0,
+                vertexShaderDisplay: 0,
+                fragmentShaderDisplay: 0,
+
+                haltonNumbers: [0, 0, 0, 0, 0, 0, 0, 0],
+                frameCounter: 0,
+            };
+            
+            var vertexBufferData = [
+               //  x     y     z    w  |   r    g    b    a
+                -1.0, -1.0, -3.0, 1.0,   1.0, 0.0, 0.0, 1.0,
+                 1.0, -1.0, -3.0, 1.0,   0.0, 1.0, 0.0, 1.0,
+                -1.0,  1.0, -3.0, 1.0,   0.0, 0.0, 1.0, 1.0,
+                 1.0,  1.0, -3.0, 1.0,   1.0, 1.0, 0.0, 1.0
+            ];
+            var elementBufferData = [
+                0, 1, 2, 3
+            ];
+                                         
+            var primes = [
+                2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47
+            ];
+
+            function onLoad()
+            {
+                var canvas = document.getElementById("webgl");
+                /*var gl = canvas.getContext("webgl");
+                if(!gl)
+                {
+                    alert("getContext() failed");
+                }*/
+                var gl = null;
+                var names = [ "webgl", "experimental-webgl", "moz-webgl", "webkit-3d" ];
+                for(var i=0; i<names.length; i++) 
+                {
+                    try 
+                    {                    
+                        gl = canvas.getContext(names[i]);
+                        if (gl) { break; }
+                    } catch (e) {}
+                }
+                if(!gl) 
+                {
+                    alert("No known OpenGL context detected! Is it enabled?");
+                    return;
+                }
+                var f = gl.getExtension("OES_texture_float");
+                if(!f) 
+                {
+                    alert("no OES_texture_float");
+                    return;
+                }
+                init(gl);
+                setInterval(function() {render(gl)}, 10);
+            }
+            
+            function init(gl)
+            {
+                resources.vertexBuffer = makeBuffer(gl, gl.ARRAY_BUFFER, new Float32Array(vertexBufferData), 8, 4);
+                resources.elementBuffer = makeBuffer(gl, gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(elementBufferData), 1, 4);
+                               
+                var vertexShaderSource = document.getElementById("vertex-shader-source").firstChild.textContent;
+                var fragmentShaderSource = document.getElementById("fragment-shader-source").firstChild.textContent;
+
+                resources.vertexShader = makeShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+                resources.fragmentShader = makeShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+                resources.programRender.id = makeProgram(gl, resources.vertexShader, resources.fragmentShader);
+                
+                resources.programRender.attributes.position = gl.getAttribLocation(resources.programRender.id, "position");
+
+                resources.programRender.uniforms.numSpheres = gl.getUniformLocation(resources.programRender.id, "numSpheres");
+                resources.programRender.uniforms.lightPos = gl.getUniformLocation(resources.programRender.id, "lightPos");
+                resources.programRender.uniforms.lightColor = gl.getUniformLocation(resources.programRender.id, "lightColor");
+                resources.programRender.uniforms.sceneTextureSampler = gl.getUniformLocation(resources.programRender.id, "sceneTexture");
+                resources.programRender.uniforms.imageDataSampler = gl.getUniformLocation(resources.programRender.id, "imageData");
+                resources.programRender.uniforms.cranleyPattersonSampler = gl.getUniformLocation(resources.programRender.id, "cranleyPatterson");
+                resources.programRender.uniforms.haltonNumbers = gl.getUniformLocation(resources.programRender.id, "haltonNumbers");
+                resources.programRender.uniforms.frameCounter = gl.getUniformLocation(resources.programRender.id, "frameCounter");
+
+                var vertexShaderSourceDisplay = document.getElementById("vertex-shader-source").firstChild.textContent;
+                var fragmentShaderSourceDisplay = document.getElementById("fragment-shader-display-source").firstChild.textContent;
+
+                resources.vertexShaderDisplay = makeShader(gl, gl.VERTEX_SHADER, vertexShaderSourceDisplay);
+                resources.fragmentShaderDisplay = makeShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSourceDisplay);
+                resources.programDisplay.id = makeProgram(gl, resources.vertexShaderDisplay, resources.fragmentShaderDisplay);
+                
+                resources.programDisplay.attributes.position = gl.getAttribLocation(resources.programDisplay.id, "position");
+                resources.programDisplay.uniforms.screenWidth = gl.getUniformLocation(resources.programDisplay.id, "screenWidth");
+                resources.programDisplay.uniforms.screenHeight = gl.getUniformLocation(resources.programDisplay.id, "screenHeight");
+                resources.programDisplay.uniforms.imageDataSampler = gl.getUniformLocation(resources.programDisplay.id, "imageData");
+
+                resources.textures.sceneTexture = gl.createTexture();
+
+                gl.bindTexture(gl.TEXTURE_2D, resources.textures.sceneTexture);               
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, scene.numSpheres, 11, 0, gl.LUMINANCE, gl.FLOAT, new Float32Array(scene.data));
+
+                resources.framebuffers.imageDataBuffer = gl.createFramebuffer();
+                gl.bindFramebuffer(gl.FRAMEBUFFER, resources.framebuffers.imageDataBuffer);
+
+                // data texture
+                resources.textures.imageDataTexture = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, resources.textures.imageDataTexture);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1024, 768, 0, gl.RGBA, gl.FLOAT, null);
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, resources.textures.imageDataTexture, 0);
+                                
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                
+                // create random texture for Cranley-Patterson rotation
+                var randomArray = new Array(1024*768*8);
+                for(var i=0; i<1024*768*8; ++i)
+                    randomArray[i] = Math.random();
+                resources.textures.cranleyPattersonTexture = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, resources.textures.cranleyPattersonTexture);               
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 1024, 8*768, 0, gl.LUMINANCE, gl.FLOAT, new Float32Array(randomArray));
+
+                bindCamera(gl);
+
+                // setup program 'render'
+                gl.useProgram(resources.programRender.id);
+               
+                initCamera([0,0,0], [0,0,-1], [0,1,0], 0.79, 1024, 768);
+                
+                uploadCamera(gl);
+                uploadScene(gl);    
+
+                gl.uniform1i(resources.programRender.uniforms.sceneTextureSampler, 0);
+                gl.uniform1i(resources.programRender.uniforms.imageDataSampler, 1);
+                gl.uniform1i(resources.programRender.uniforms.cranleyPattersonSampler, 2);
+
+                // setup program 'Display'
+                gl.useProgram(resources.programDisplay.id);
+                gl.uniform1f(resources.programDisplay.uniforms.screenWidth, 1024.);
+                gl.uniform1f(resources.programDisplay.uniforms.screenHeight, 768.);
+                gl.uniform1i(resources.programRender.uniforms.imageDataSampler, 0);
+                
+                frameCounter = 0;
+            }
+            
+            function render(gl)
+            {
+                gl.clearColor(0, 0, 0, 1);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                
+                gl.bindBuffer(gl.ARRAY_BUFFER, resources.vertexBuffer);
+                
+                // render next frame
+                gl.useProgram(resources.programRender.id);
+                                
+                gl.vertexAttribPointer(resources.programRender.attributes.position, 4, gl.FLOAT, false, 8*4, 0);               
+                gl.enableVertexAttribArray(resources.programRender.attributes.position);
+                
+                gl.bindFramebuffer(gl.FRAMEBUFFER, resources.framebuffers.imageDataBuffer);
+                
+                gl.viewport(0, 0, 1024, 768);
+                
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, resources.textures.sceneTexture);               
+                
+                gl.activeTexture(gl.TEXTURE1);
+                gl.bindTexture(gl.TEXTURE_2D, resources.textures.imageDataTexture);
+                
+                gl.activeTexture(gl.TEXTURE2);
+                gl.bindTexture(gl.TEXTURE_2D, resources.textures.cranleyPattersonTexture);
+
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, resources.elementBuffer);
+                
+                // render 10 frames before displaying
+                for(var j=0; j<10; ++j)
+                {
+                    for(var i=0; i<8; ++i)
+                        resources.haltonNumbers[i] = nextHalton(1./primes[i], resources.haltonNumbers[i]);
+                    gl.uniform1fv(resources.programRender.uniforms.haltonNumbers, new Float32Array(resources.haltonNumbers));
+                    gl.uniform1f(resources.programRender.uniforms.frameCounter, ++resources.frameCounter);
+                    gl.drawElements(gl.TRIANGLE_STRIP, 4, gl.UNSIGNED_SHORT, 0);
+                }
+                
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                
+                gl.disableVertexAttribArray(resources.programRender.attributes.position);
+
+                // display frame
+                gl.useProgram(resources.programDisplay.id);
+
+                gl.vertexAttribPointer(resources.programDisplay.attributes.position, 4, gl.FLOAT, false, 8*4, 0);               
+                gl.enableVertexAttribArray(resources.programDisplay.attributes.position);
+                
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, resources.textures.imageDataTexture);
+
+                gl.viewport(0, 0, 1024, 768);
+                
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, resources.elementBuffer);
+                gl.drawElements(gl.TRIANGLE_STRIP, 4, gl.UNSIGNED_SHORT, 0);              
+                
+                gl.disableVertexAttribArray(resources.programDisplay.attributes.position);
+            }
+
+            
+            var camera = {
+                pos: [0, 0, 0],
+                up : [0, 1, 0],
+                dir : [0, 0, -1],
+                focalLength: 1,
+                screenWidth: 0,
+                screenHeight: 0,
+                stepX: 0,
+                stepY: 0,
+                aspect: 0,
+            };
+            var scene = {
+                numSpheres: 9,
+                data : [
+                /*x*/      -30006., 0.,      30006., 0.,     0.,       4.,     0.,  -1.,  -4.,
+                /*y*/       0.,     0.,      0.,     30006.01, -30006., -4.,35.95,  -5.,  -4.5,
+                /*z*/       0,      -30015., 0.,     0.,     0.,     -12.,   -12., -11., -13.,
+                /*radius*/  30000., 30000.,  30000., 30000., 30000.,   2.,    30.,   1.,   1.5,
+                /*type*/    0.,     0.,      0.,     0.,     0.,       2.,     0.,   2.,   0.,
+                /*r*/       1.,     1.,      0.,     1.,     1.,       1.,     0.,   1.,   0.,
+                /*g*/       0.,     1.,      1.,     1.,     1.,       1.,     0.,   1.,   0.,
+                /*b*/       0.,     0.,      0.,     0.,     0.,       1.,     0.,   1.,   1.,
+                /*er*/      0.,     0.,      0.,     0.,     0.,       0.,    50.,   0.,   0.,
+                /*eg*/      0.,     0.,      0.,     0.,     0.,       0.,    50.,   0.,   0.,
+                /*eb*/      0.,     0.,      0.,     0.,     0.,       0.,    50.,   0.,   0.,
+                ],
+
+                lightPos: [0,5,-12],
+                lightColor: [200,200,200],
+            };
+            
+            function initCamera(pos, dir, up, fovy, screenWidth, screenHeight)
+            {
+                camera.pos = pos;
+                camera.dir = dir;
+                camera.up = up;
+                camera.aspect = screenWidth / screenHeight;
+                camera.screenWidth = screenWidth;
+                camera.screenHeight = screenHeight;
+                
+                camera.focalLength = 1;
+                
+                camera.height = camera.focalLength / (2.*Math.tan(fovy/2.));
+                camera.width = camera.aspect * camera.height;
+                
+                camera.stepX = camera.width / camera.screenWidth;
+                camera.stepY = camera.height / camera.screenHeight;
+            }
+
+            function bindCamera(gl)
+            {
+                resources.programRender.uniforms.cameraPos = gl.getUniformLocation(resources.programRender.id, "cameraPos");
+                resources.programRender.uniforms.cameraUp = gl.getUniformLocation(resources.programRender.id, "cameraUp");
+                resources.programRender.uniforms.cameraDir = gl.getUniformLocation(resources.programRender.id, "cameraDir");
+                resources.programRender.uniforms.stepX = gl.getUniformLocation(resources.programRender.id, "stepX");
+                resources.programRender.uniforms.stepY = gl.getUniformLocation(resources.programRender.id, "stepY");
+                resources.programRender.uniforms.screenWidth = gl.getUniformLocation(resources.programRender.id, "screenWidth");
+                resources.programRender.uniforms.screenHeight = gl.getUniformLocation(resources.programRender.id, "screenHeight");
+                resources.programRender.uniforms.focalLength = gl.getUniformLocation(resources.programRender.id, "focalLength");
+            }
+            
+            function uploadCamera(gl)
+            {
+                gl.uniform3fv(resources.programRender.uniforms.cameraPos, new Float32Array(camera.pos));
+                gl.uniform3fv(resources.programRender.uniforms.cameraUp, new Float32Array(camera.up));
+                gl.uniform3fv(resources.programRender.uniforms.cameraDir, new Float32Array(camera.dir));
+                gl.uniform1f(resources.programRender.uniforms.stepX, camera.stepX);
+                gl.uniform1f(resources.programRender.uniforms.stepY, camera.stepY);
+                gl.uniform1f(resources.programRender.uniforms.screenWidth, camera.screenWidth);
+                gl.uniform1f(resources.programRender.uniforms.screenHeight, camera.screenHeight);
+                gl.uniform1f(resources.programRender.uniforms.focalLength, camera.focalLength);
+            }
+            
+            function uploadScene(gl)
+            {
+                gl.uniform1f(resources.programRender.uniforms.numSpheres, scene.numSpheres);
+
+                gl.uniform3fv(resources.programRender.uniforms.lightPos, new Float32Array(scene.lightPos));
+                gl.uniform3fv(resources.programRender.uniforms.lightColor, new Float32Array(scene.lightColor));
+            }
+        </script>
+    </head>
+    <body onload="onLoad()">
+        <canvas id="webgl" style="border: none;" width="1024" height="768"></canvas> 
+    </body>
+</html>
